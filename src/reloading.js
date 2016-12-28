@@ -32,6 +32,15 @@
  */
 function loader(mappings, entryPoints, options) {
 
+	var previousRequire;
+	if (typeof require == "function") {
+		previousRequire = require;
+	}
+	var previousBundle;
+	if (typeof __livereactload_export != "undefined") {
+		previousBundle = __livereactload_export;
+	}
+
   if (entryPoints.length > 1) {
     throw new Error(
       "LiveReactLoad supports only one entry point at the moment"
@@ -52,7 +61,9 @@ function loader(mappings, entryPoints, options) {
       } finally {
         scope.reloading = false;
       }
-    }
+    },
+	changedModules: [],
+	newMods: []
   };
 
 
@@ -68,12 +79,14 @@ function loader(mappings, entryPoints, options) {
     var url = protocol + "://" + (options.host || window.location.hostname) + ":" + options.port;
     var ws = new WebSocket(url);
     ws.onopen = function () {
+	  ws.send(JSON.stringify({type: "browser"}));
       info("WebSocket client listening for changes...");
     };
     ws.onmessage = function (m) {
       var msg = JSON.parse(m.data);
       if (msg.type === "change") {
-        handleBundleChange(msg.data);
+		debug("Recieved change ws message");
+	    handleChangeMessage(msg.data);
       } else if (msg.type === "bundle_error") {
         handleBundleError(msg.data);
       }
@@ -115,7 +128,10 @@ function loader(mappings, entryPoints, options) {
     if (!cache[id]) {
       if (!mappings[id]) {
         var req = typeof require == "function" && require;
-        if (req) return req(id);
+        if (!recur && req) return req(id, true);
+
+	  if (previousRequire) return previousRequire(id, true);
+
         var error = new Error("Cannot find module '" + id + "'");
         error.code = "MODULE_NOT_FOUND";
         throw error;
@@ -200,20 +216,12 @@ function loader(mappings, entryPoints, options) {
    *    Changes array received from "patch" function
    */
   function reload(changes) {
-    var changedModules = changes.map(function (c) {
-      return c[0];
-    });
-    var newMods = changes.filter(function (c) {
-      return !c[1];
-    }).map(function (c) {
-      return c[0];
-    });
 
     scope.reload(function () {
       try {
         info("Applying changes...");
-        debug("Changed modules", changedModules);
-        debug("New modules", newMods);
+        debug("Changed modules", scope.changedModules);
+        debug("New modules", scope.newMods);
         evaluate(entryId, {});
         info("Reload complete!");
       } catch (e) {
@@ -233,17 +241,39 @@ function loader(mappings, entryPoints, options) {
     })
 
 
+    function restore() {
+      changes.forEach(function (c) {
+        var id = c[0], mapping = c[1];
+        if (mapping) {
+          debug("Restore old mapping", id);
+          scope.mappings[id] = mapping;
+        } else {
+          debug("Delete new mapping", id);
+          delete scope.mappings[id];
+        }
+      })
+    }
+  }
+
     function evaluate(id, changeCache) {
       if (id in changeCache) {
         debug("Circular dependency detected for module", id, "not traversing any further...");
         return changeCache[id];
       }
       if (isExternalModule(id)) {
-        debug("Module", id, "is an external module. Do not reload");
-        return false;
+		  if (previousBundle) {
+			  debug('Using previous evaluate for ' + id);
+			  return previousBundle.evaluate(id, changeCache);
+		  }
+		  else {
+			  debug("External module & no previous bundle, not loading");
+			  return false;
+		  }
       }
+		var changedModules = scope.changedModules;
+		var newMods = scope.newMods;
+
       var module = getModule(id);
-      debug("Evaluate module details", module);
 
       // initially mark change status to follow module's change status
       // TODO: how to propagate change status from children to this without causing infinite recursion?
@@ -290,6 +320,14 @@ function loader(mappings, entryPoints, options) {
       }
     }
 
+  function getModule(id) {
+    return {
+      deps: vals(scope.mappings[id][1]),
+      meta: scope.mappings[id][2],
+      cached: scope.cache[id]
+    };
+  }
+
     function allExportsProxies(id) {
       var e = scope.cache[id].exports;
       return isProxy(e) || (isPlainObj(e) && all(vals(e), isProxy));
@@ -308,28 +346,44 @@ function loader(mappings, entryPoints, options) {
       return accepted === true;
     }
 
-    function restore() {
-      changes.forEach(function (c) {
-        var id = c[0], mapping = c[1];
-        if (mapping) {
-          debug("Restore old mapping", id);
-          scope.mappings[id] = mapping;
-        } else {
-          debug("Delete new mapping", id);
-          delete scope.mappings[id];
-        }
-      })
-    }
-  }
+	function handleChangeMessage(newMappings) {
+		changes = patchAllBundles(newMappings);
+		if (keys(changes).length > 0) {
+			reload(changes);
+		} else {
+		  info("Nothing to reload");
+		}
+	}
 
-  function getModule(id) {
-    return {
-      deps: vals(scope.mappings[id][1]),
-      meta: scope.mappings[id][2],
-      cached: scope.cache[id]
-    };
-  }
+	function patchAllBundles(newMappings) {
+		debug("patchAllBundles() - bundle id:", options.bundleId);
 
+		if (options.bundleId) {
+			var changes = patch(newMappings[options.bundleId]);
+			if (previousBundle) {
+				var otherBundleChanges = previousBundle.patchAllBundles(newMappings);
+				debug("previous bundle changes:", otherBundleChanges);
+				changes = changes.concat(otherBundleChanges);
+			}
+		}
+		else {
+			var changes = patch(newMappings);
+		}
+		var changedModules = changes.map(function (c) {
+		  return c[0];
+		});
+		var newMods = changes.filter(function (c) {
+		  return !c[1];
+		}).map(function (c) {
+		  return c[0];
+		});
+	  scope.changedModules = changedModules;
+	  scope.newMods = newMods;
+		debug("returning changes:", changes);
+		return changes;
+	}
+
+	/*
   function handleBundleChange(newMappings) {
     info("Bundle changed");
     var changes = patch(newMappings);
@@ -339,12 +393,12 @@ function loader(mappings, entryPoints, options) {
       info("Nothing to reload");
     }
   }
+  */
 
   function handleBundleError(data) {
     error("Bundling error occurred");
     error(data.error);
   }
-
 
   // prepare mappings before starting the app
   forEachValue(scope.mappings, compile);
@@ -366,7 +420,25 @@ function loader(mappings, entryPoints, options) {
 
   startClient();
   // standalone bundles may need the exports from entry module
-  return load(entryId);
+	// CDG
+	var loadedEntry = {};
+	if (entryId) {
+		loadedEntry = load(entryId);
+	}
+	/*
+	else {
+		if (options.externalEntries) {
+			entryId = options.externalEntries[0];
+		}
+		else {
+			error("No JavaScript entry file was given");
+		}
+	}
+	*/
+	loadedEntry.load = load;
+	loadedEntry.evaluate = evaluate;
+	loadedEntry.patchAllBundles = patchAllBundles;
+	return loadedEntry;
 
 
   // this function is stringified in browserify process and appended to the bundle
@@ -387,6 +459,11 @@ function loader(mappings, entryPoints, options) {
   function isExternalModule(id) {
     return !(id in scope.mappings);
   }
+
+	function isExternalEntry(id) {
+		return options.externalEntries && options.externalEntries.indexOf ?
+			options.externalEntries.indexOf(id) >= 0 : false;
+	}
 
   function keys(obj) {
     return obj ? Object.keys(obj) : [];

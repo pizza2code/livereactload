@@ -9,7 +9,7 @@ function logError(error) {
   }
 }
 
-export function startServer({port, sslKey, sslCert}) {
+export function startServer({port, sslKey, sslCert, debug}) {
   if ((sslCert && !sslKey) || (!sslCert && sslKey)) {
     throw new Error('You need both a certificate AND key in order to use SSL');
   }
@@ -26,37 +26,104 @@ export function startServer({port, sslKey, sslCert}) {
     wss = new Server({port});
   }
 
+	let bundling = {};
+	let changes = {};
+	let browserClients = [];
 
-  log("Reload server up and listening in port " + port + "...")
+  log("Using port " + port + "...")
 
   const server = {
-    notifyReload(metadata) {
-      if (wss.clients.length) {
-        log("Notify clients about bundle change...")
-      }
-      wss.clients.forEach(client => {
-        client.send(JSON.stringify({
-          type: "change",
-          data: metadata
-        }), logError)
-      })
+	  notifyBundling(bundleId) {
+		if (browserClients.length) {
+		  logDebug("Starting to bundle " + bundleId + "...")
+		  bundling[bundleId] = true
+	  	}	
+	  },
+    notifyReload(metadata, bundleId) {
+      if (browserClients.length) {
+		changes[bundleId] = metadata
+		bundling[bundleId] = false
+		logDebug("Finished bundling " + bundleId)
+	
+		if (none(bundling)) {
+		  bundling = {};
+		  log("Notifying clients of bundle changes")
+		  browserClients.forEach(client => {
+			client.send(JSON.stringify({
+			  type: "change",
+			  data: changes
+			}), logError)
+		  });
+		  changes = {};
+		}
+		else {
+		  logDebug("Waiting on other bundles...")
+		}
+	  }
     },
     notifyBundleError(error) {
-      if (wss.clients.length) {
+      if (browserClients.length) {
         log("Notify clients about bundle error...")
+		browserClients.forEach(client => {
+		  client.send(JSON.stringify({
+		    type: "bundle_error",
+		    data: { error: error.toString() }
+		  }), logError)
+		})
       }
-      wss.clients.forEach(client => {
-        client.send(JSON.stringify({
-          type: "bundle_error",
-          data: { error: error.toString() }
-        }), logError)
-      })
     }
   }
 
   wss.on("connection", client => {
-    log("New client connected")
+	// receives messages from external bundling processes & from browser clients
+	client.on("message", msg => {
+		const parsedMsg = JSON.parse(msg);
+		const {type, bundleId, data} = parsedMsg;
+		switch (type) {
+			case "browser":
+				log("New client connected")
+				browserClients.push(client)
+				break;
+			case "reload":
+				server.notifyReload(data, bundleId);
+				break;
+			case "bundling":
+				server.notifyBundling(bundleId);
+				break;
+			default:
+				logError("Unexpected message: " + msg);
+				break;
+		}
+	});
+
+	client.on("close", () => {
+		// remove disconnected browser clients
+		browserClients = browserClients.filter((c) => {
+			if (c === client) {
+				log("Client disconnected");
+				return false;
+			}
+			return true;
+		});
+	});
   })
+
+	function none(obj) {
+		if (obj) {
+			for (const prop in obj) {
+				if (obj.hasOwnProperty(prop) && obj[prop]) {
+					return false
+				}
+			}
+		}
+		return true
+	}
+
+	function logDebug(msg) {
+		if (debug) {
+			log(msg);
+		}
+	}
 
   return server
 }
