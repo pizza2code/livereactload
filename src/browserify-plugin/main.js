@@ -22,6 +22,7 @@ function LiveReactloadPlugin(b, opts = {}) {
 	  client = true,
 	  dedupe = true,
 	  debug = false,
+	  transform = true,
 	  basedir = process.cwd(),
 	  'ssl-cert': sslCert = null,
 	  'ssl-key': sslKey = null,
@@ -52,7 +53,8 @@ function LiveReactloadPlugin(b, opts = {}) {
     clientEnabled: client,
     debug: debug,
 	  externalEntries: opts.externalEntries,
-	  bundleId: opts.bundleId
+	  bundleId: opts.bundleId,
+	transform: transform
   }
 
 	b.on("reset", addHooks)
